@@ -147,7 +147,7 @@ fi
 
 # Enable merge support if needed
 if [ "$HIVE_TERMINAL_TOTAL_DIFFICULTY" != "" ]; then
-    RPCFLAGS="$RPCFLAGS --engine-host-allowlist=* --Xmerge-support true"
+    RPCFLAGS="$RPCFLAGS --engine-rpc-enabled --engine-rpc-port=8550 --engine-host-allowlist=* --Xmerge-support true"
     FLAGS="$FLAGS --sync-mode=FULL"
 fi
 
