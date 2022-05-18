@@ -55,6 +55,11 @@ Client must reject GetPayload directives under PoW.
 - Invalid Terminal Block in NewPayload:  
 Client must reject NewPayload directives if the referenced ParentHash does not meet the TTD requirement.
 
+- Inconsistent ForkchoiceState:
+Send an inconsistent ForkchoiceState with a known payload that belongs to a side chain as head, safe or finalized:
+Having `A: Genesis <- P1 <- P2 <- P3`, `B: Genesis <- P1' <- P2' <- P3'`, 
+send `fcU(Head: P3', Safe: P2, Finalized: P1)`, `fcU(Head: P3, Safe: P2', Finalized: P1)`, and `fcU(Head: P3, Safe: P2, Finalized: P1')`
+
 - Unknown HeadBlockHash:  
 Perform a forkchoiceUpdated call with an unknown (random) HeadBlockHash, the client should initiate the syncing process.
 
@@ -70,38 +75,6 @@ Expected outcome is that the forkchoiceUpdate proceeds, but the call returns an 
 
 - Pre-TTD Block Hash:  
 Perform a forkchoiceUpdated call using a block hash part of the canonical chain that precedes the block where the TTD occurred. (Behavior is undefined for this edge case and not verified, but should not produce unrecoverable error)
-
-- Bad blockhash on NewPayload:  
-Send a NewPayload directive to the client including an incorrect BlockHash, should result in an error in all the following cases:
-   - NewPayload while not syncing, on canonical chain
-   - NewPayload while not syncing, on side chain
-   - NewPayload while syncing, on canonical chain
-   - NewPayload while syncing, on side chain
-
-- ParentHash==BlockHash on NewPayload:  
-Send a NewPayload directive to the client including ParentHash that is equal to the BlockHash (Incorrect hash).
-
-- Invalid Field in NewPayload:  
-Send an invalid payload in NewPayload by modifying fields of a valid ExecutablePayload while maintaining a valid BlockHash.
-After attempting to NewPayload/ForkchoiceUpdated the invalid payload, also attempt to send a valid payload that contains the previously modified invalid payload as parent (should also fail).
-Test also has variants with a missing parent payload (client is syncing):
-I.e. Skip sending NewPayload to the client, but send the ForkchoiceUpdated to this missing payload, which will send the client to Syncing, then send the invalid payload.
-Modify fields including:
-   - ParentHash
-   - StateRoot
-   - ReceiptsRoot
-   - BlockNumber
-   - GasLimit
-   - GasUsed
-   - Timestamp
-   - PrevRandao
-   - Removing a Transaction
-   - Transaction with incorrect fields:
-      - Signature
-      - Nonce
-      - GasPrice
-      - Gas
-      - Value
 
 ### Eth RPC Status on ForkchoiceUpdated Events:
 - Latest Block after NewPayload:  
@@ -134,6 +107,54 @@ The payloads should be ACCEPTED/SYNCING, and the last payload should be VALID (s
 - Valid NewPayload->ForkchoiceUpdated on Syncing Client:
 Skip sending NewPayload to the client, but send the ForkchoiceUpdated to this missing payload, which will send the client to Syncing, then send the valid payload. Response should be either `ACCEPTED` or `SYNCING`.
 
+### Invalid Payload Tests
+- Bad blockhash on NewPayload:  
+Send a NewPayload directive to the client including an incorrect BlockHash, should result in an error in all the following cases:
+   - NewPayload while not syncing, on canonical chain
+   - NewPayload while not syncing, on side chain
+   - NewPayload while syncing, on canonical chain
+   - NewPayload while syncing, on side chain
+
+- ParentHash==BlockHash on NewPayload:  
+Send a NewPayload directive to the client including ParentHash that is equal to the BlockHash (Incorrect hash).
+
+- Invalid Field in NewPayload:  
+Send an invalid payload in NewPayload by modifying fields of a valid ExecutablePayload while maintaining a valid BlockHash.
+After attempting to NewPayload/ForkchoiceUpdated the invalid payload, also attempt to send a valid payload that contains the previously modified invalid payload as parent (should also fail).
+Test also has variants with a missing parent payload (client is syncing):
+I.e. Skip sending NewPayload to the client, but send the ForkchoiceUpdated to this missing payload, which will send the client to Syncing, then send the invalid payload.
+Modify fields including:
+   - ParentHash
+   - StateRoot
+   - ReceiptsRoot
+   - BlockNumber
+   - GasLimit
+   - GasUsed
+   - Timestamp
+   - PrevRandao
+   - Removing a Transaction
+   - Transaction with incorrect fields:
+      - Signature
+      - Nonce
+      - GasPrice
+      - Gas
+      - Value
+
+- Invalid Ancestor Re-Org Tests
+Attempt to re-org to an unknown side chain which at some point contains an invalid payload.
+The side chain is constructed in parallel while the CL Mock builds the canonical chain, but changing the extraData to simply produce a different hash.
+At a given point, the side chain invalidates one of the payloads by modifying one of the payload fields.
+Once the side chain reaches a certain deviation height (N) from the commonAncestor, the CL switches to it by either of the following methods:
+a) `newPayload` each of the payloads in the side chain, and the invalid payload shall return `INVALID`
+b) Force the main client to partially sync the side chain by sending the initial slice of the chain (before the invalid payload) to another client, and the rest to the primary client.
+Method (b) results in the client returning `ACCEPTED` or `SYNCING` on the `newPayload(INV_P)`, but eventually the client must return `INVALID` to the head of the side chain because it was built on top of an invalid payload.
+```
+commonAncestor◄─▲── P1 ◄─ P2 ◄─ P3 ◄─ ... ◄─ Pn
+		          │
+		          └── P1' ◄─ P2' ◄─ ... ◄─ INV_P ◄─ ... ◄─ Pn'
+```
+
+
 ### Re-org using Engine API
 - Transaction Reorg using ForkchoiceUpdated:  
 Send transactions that modify the state tree after the PoS switch and verify that the modifications are correctly rolled back when a ForkchoiceUpdated event occurs with a block on a different chain than the block where the transaction was included.
@@ -143,6 +164,10 @@ Send a transaction that modifies the state, ForkchoiceUpdate to the payload cont
 
 - Re-Org Back into Canonical Chain:  
 Test that performing a re-org back into a previous block of the canonical chain does not produce errors and the chain is still capable of progressing.
+
+- Re-Org Back to Canonical Chain From Syncing Chain:
+Build an alternative chain of 10 payloads.
+Perform `newPayload(P10')` + `fcU(P10')`, which should result in client `SYNCING`. Verify that the client can re-org back to the canonical chain after sending `newPayload(P11)` + `fcU(P11)`.
 
 ### Suggested Fee Recipient in Payload creation
 - Suggested Fee Recipient Test:  
@@ -199,11 +224,78 @@ ForkchoiceUpdated is sent to Client 1 with C as Head.
 Verification is made that Client 1 Re-orgs to chain G -> B -> C.  
 
 - Two Block PoW Re-org to Lower-Height Chain:  
- Client 1 starts with chain G -> A -> B, Client 2 starts with chain G -> C.  
- Blocks B and C reach TTD, but block B has higher height than C.  
- ForkchoiceUpdated is sent to Client 1 with B as Head.  
- ForkchoiceUpdated is sent to Client 1 with C as Head.  
- Verification is made that Client 1 Re-orgs to chain G -> C.  
+Client 1 starts with chain G -> A -> B, Client 2 starts with chain G -> C.  
+Blocks B and C reach TTD, but block B has higher height than C.  
+ForkchoiceUpdated is sent to Client 1 with B as Head.  
+ForkchoiceUpdated is sent to Client 1 with C as Head.  
+Verification is made that Client 1 Re-orgs to chain G -> C.  
+
+- Two Block PoW Re-org to Lower-Height Chain, Transaction Overwrite
+Client 1 starts with chain G -> A -> B, Client 2 starts with chain G -> C. 
+Blocks B and C reach TTD, but block B has higher height than C.  
+Block A and C contain TX1, and Block B contains TX2.
+TX1 and TX2 use the DIFFICULTY/PREVRANDAO opcode into storage. 
+ForkchoiceUpdated is sent to Client 1 with B as Head.  
+ForkchoiceUpdated is sent to Client 1 with C as Head.  
+Verification is made that Client 1 Re-orgs to chain G -> C.  
+PoS chain on top of C contains TX2, which was originally part of the PoW chain.
+Verification is made that the resulting PoS storage contains PREVRANDAO instead of DIFFICULTY.
+
+- Two Block Post-PoS Re-org to Higher-Total-Difficulty PoW Chain:
+Client 1 starts with chain G -> A.
+ForkchoiceUpdated is sent to Client 1 with A as Head.
+Two PoS blocks are produced on top of A.
+Client 2 starts with chain G -> B.  
+Blocks A and B reach TTD, but block B has higher difficulty than A.  
+ForkchoiceUpdated is sent to Client 1 with B as Head.  
+PoS Chain is continued on top of B.
+Verification is made that Client 1 Re-orgs to chain G -> B -> ... 
+
+- Two Block Post-PoS Re-org to Lower-Total-Difficulty PoW Chain:
+Client 1 starts with chain G -> A.
+ForkchoiceUpdated is sent to Client 1 with A as Head.
+Two PoS blocks are produced on top of A.
+Client 2 starts with chain G -> B.  
+Blocks A and B reach TTD, but block A has higher difficulty than B.  
+ForkchoiceUpdated is sent to Client 1 with B as Head.  
+PoS Chain is continued on top of B.
+Verification is made that Client 1 Re-orgs to chain G -> B -> ... 
+
+- Two Block Post-PoS Re-org to Higher-Height PoW Chain:
+Client 1 starts with chain G -> A.
+ForkchoiceUpdated is sent to Client 1 with A as Head.
+Two PoS blocks are produced on top of A.
+Client 2 starts with chain G -> B -> C.  
+Blocks A and C reach TTD, but have different heights.  
+ForkchoiceUpdated is sent to Client 1 with C as Head.  
+PoS Chain is continued on top of C.
+Verification is made that Client 1 Re-orgs to chain G -> B -> C -> ...  
+
+- Two Block Post-PoS Re-org to Lower-Height PoW Chain:
+Client 1 starts with chain G -> A -> B.
+ForkchoiceUpdated is sent to Client 1 with B as Head.
+Two PoS blocks are produced on top of B.
+Client 2 starts with chain G -> C.  
+Blocks B and C reach TTD, but have different heights.  
+ForkchoiceUpdated is sent to Client 1 with C as Head.  
+PoS Chain is continued on top of C.
+Verification is made that Client 1 Re-orgs to chain G -> C -> ...  
+
+- Transition to a Chain with Invalid Terminal Block, Incorrectly Configured Higher Total Difficulty
+Client 1 starts with chain G -> A, Client 2 starts with chain G -> A -> B.  
+Client 1's configured TTD is reached by A.
+Client 2's configured TTD is reached by B.
+ForkchoiceUpdated is sent to both clients with B as Head.  
+PoS chain is continued on top of B.
+Verification is made that Client 1 never re-orgs to chain G -> A -> B due to incorrect Terminal block.  
+
+- Transition to a Chain with Invalid Terminal Block, Incorrectly Configured Lower Total Difficulty
+Client 1 starts with chain G -> A -> B, Client 2 starts with chain G -> A.  
+Client 1's configured TTD is reached by B.
+Client 2's configured TTD is reached by A.
+ForkchoiceUpdated is sent to both clients with A as Head.  
+PoS chain is continued on top of A.
+Verification is made that Client 1 never re-orgs to chain G -> A -> ... due to incorrect Terminal block. 
 
 - Halt following PoW chain:  
  Client 1 starts with chain G -> A, Client 2 starts with chain G -> A -> B.  

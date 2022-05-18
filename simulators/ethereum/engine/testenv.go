@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -164,6 +165,84 @@ func (t *TestEnv) sendNextTransaction(sender *EngineClient, recipient common.Add
 		case <-time.After(time.Second):
 		case <-t.Timeout:
 			t.Fatalf("FAIL (%s): Timeout while trying to send transaction: %v", t.TestName, err)
+		}
+	}
+}
+
+// Method that attempts to create a contract filled with zeros without going over the specified gasLimit
+func (t *TestEnv) makeNextBigContractTransaction(gasLimit uint64) *types.Transaction {
+	// Total GAS: Gtransaction == 21000, Gcreate == 32000, Gcodedeposit == 200
+	contractLength := uint64(0)
+	if gasLimit > (21000 + 32000) {
+		contractLength = (gasLimit - 21000 - 32000) / 200
+		if contractLength >= 1 {
+			// Reduce by 1 to guarantee using less gas than requested
+			contractLength -= 1
+		}
+	}
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, contractLength)
+
+	initCode := []byte{
+		0x67, // PUSH8
+	}
+	initCode = append(initCode, buf...) // Size of the contract in byte length
+	initCode = append(initCode, 0x38)   // CODESIZE == 0x00
+	initCode = append(initCode, 0xF3)   // RETURN(offset, length)
+
+	txData := types.LegacyTx{
+		Nonce:    t.nonce,
+		GasPrice: gasPrice,
+		Gas:      gasLimit,
+		To:       nil,
+		Value:    big0,
+		Data:     initCode,
+	}
+	signer := types.NewEIP155Signer(chainID)
+	signedTx := types.MustSignNewTx(vaultKey, signer, &txData)
+	t.nonce++
+	return signedTx
+}
+
+func (t *TestEnv) sendNextBigContractTransaction(sender *EngineClient, gasLimit uint64) *types.Transaction {
+	tx := t.makeNextBigContractTransaction(gasLimit)
+	for {
+		err := sender.Eth.SendTransaction(sender.Ctx(), tx)
+		if err == nil {
+			return tx
+		}
+		select {
+		case <-time.After(time.Second):
+		case <-t.Timeout:
+			t.Fatalf("FAIL (%s): Timeout while trying to send transaction: %v", t.TestName, err)
+		}
+	}
+}
+
+// Verify that the client progresses after a certain PoW block still in PoW mode
+func (t *TestEnv) verifyPoWProgress(lastBlockHash common.Hash) {
+	// Get the block number first
+	lb, err := t.Eth.BlockByHash(t.Ctx(), lastBlockHash)
+	if err != nil {
+		t.Fatalf("FAIL (%s): Unable to fetch block: %v", t.TestName, err)
+	}
+	nextNum := lb.Number().Int64() + 1
+	for {
+		nh, err := t.Eth.HeaderByNumber(t.Ctx(), big.NewInt(nextNum))
+		if err == nil {
+			// Chain has progressed, check that the next block is also PoW
+			// Difficulty must NOT be zero
+			if nh.Difficulty.Cmp(big0) == 0 {
+				t.Fatalf("FAIL (%s): Expected PoW chain to progress in PoW mode, but following block difficulty==%v", t.TestName, nh.Difficulty)
+			}
+			// Chain is still PoW/Clique
+			return
+		}
+		t.Logf("INFO (%s): Error getting block, will try again: %v", t.TestName, err)
+		select {
+		case <-t.Timeout:
+			t.Fatalf("FAIL (%s): Timeout while waiting for PoW chain to progress", t.TestName)
+		case <-time.After(time.Second):
 		}
 	}
 }
