@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -118,14 +119,11 @@ func runTest(t *hivesim.T, c *hivesim.Client, test *rpcTest) error {
 				continue
 			}
 
-			// Patch JSON to remove error messages. We only do this in the specific case
-			// where an error is expected AND returned by the client.
+			// Patch JSON to remove error messages wherever both the client and expected
+			// response contain an error object. This handles both top-level JSON-RPC
+			// errors and nested errors (e.g. eth_simulateV1 calls[].error.message).
 			var errorRedacted bool
-			if hasError && gjson.Get(expectedData, "error").Exists() {
-				resp, _ = sjson.Delete(resp, "error.message")
-				expectedData, _ = sjson.Delete(expectedData, "error.message")
-				errorRedacted = true
-			}
+			resp, expectedData, errorRedacted = redactErrorMessages(resp, expectedData)
 
 			// Compare responses.
 			opts := &jsondiff.Options{
@@ -153,6 +151,76 @@ func runTest(t *hivesim.T, c *hivesim.Client, test *rpcTest) error {
 		t.Fatalf("unhandled response in test case")
 	}
 	return nil
+}
+
+// redactErrorMessages removes the "message" field from every "error" object
+// present in both the response and expected JSON. Client-specific wording is
+// thereby excluded from comparison while the shape and other fields of the
+// error are still checked. Returns the modified payloads and whether any
+// redaction occurred.
+//
+// Both top-level JSON-RPC errors and nested errors (e.g. eth_simulateV1
+// calls[].error.message) are handled. The walk does not descend into "error"
+// objects themselves, so errors nested inside another error's payload are not
+// touched.
+func redactErrorMessages(resp, expected string) (string, string, bool) {
+	paths := collectErrorMessagePaths(nil, "", gjson.Parse(resp), gjson.Parse(expected))
+	if len(paths) == 0 {
+		return resp, expected, false
+	}
+	// Deleting "<path>.message" never changes object keys or array indices
+	// elsewhere, so the collected paths remain valid regardless of order.
+	for _, p := range paths {
+		resp, _ = sjson.Delete(resp, p)
+		expected, _ = sjson.Delete(expected, p)
+	}
+	return resp, expected, true
+}
+
+// collectErrorMessagePaths walks the expected tree in parallel with the
+// response tree and appends the sjson path of every "error.message" field
+// present on both sides.
+func collectErrorMessagePaths(paths []string, path string, respVal, expectedVal gjson.Result) []string {
+	switch {
+	case expectedVal.IsObject():
+		expectedVal.ForEach(func(key, val gjson.Result) bool {
+			k := key.String()
+			respChild := respVal.Get(k)
+			if !respChild.Exists() {
+				return true
+			}
+			childPath := joinPath(path, k)
+			if k == "error" {
+				if val.Get("message").Exists() && respChild.Get("message").Exists() {
+					paths = append(paths, childPath+".message")
+				}
+				// Do not descend into the error object itself.
+				return true
+			}
+			paths = collectErrorMessagePaths(paths, childPath, respChild, val)
+			return true
+		})
+	case expectedVal.IsArray():
+		i := 0
+		expectedVal.ForEach(func(_, val gjson.Result) bool {
+			idx := strconv.Itoa(i)
+			i++
+			respChild := respVal.Get(idx)
+			if !respChild.Exists() {
+				return true
+			}
+			paths = collectErrorMessagePaths(paths, joinPath(path, idx), respChild, val)
+			return true
+		})
+	}
+	return paths
+}
+
+func joinPath(parent, child string) string {
+	if parent == "" {
+		return child
+	}
+	return parent + "." + child
 }
 
 // checkJSONStructure checks whether the `actual` value matches the type structure
