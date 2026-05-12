@@ -42,11 +42,13 @@ from lean_spec.subspecs.networking.transport.quic.connection import (
     QuicStream,
 )
 from lean_spec.subspecs.node import Node, NodeConfig
+from lean_spec.subspecs.xmss.aggregation import AggregatedSignatureProof
 from lean_spec.subspecs.ssz.hash import hash_tree_root
 from lean_spec.subspecs.validator import ValidatorRegistry
 from lean_spec.subspecs.validator.registry import ValidatorEntry
 from lean_spec.subspecs.xmss import SecretKey
 from lean_spec.types import Bytes32
+from lean_spec.types.aggregation import AggregationBits, ValidatorIndices
 from lean_spec.types.collections import SSZList, SSZVector, _validate_offsets
 from lean_spec.types.constants import OFFSET_BYTE_LENGTH
 from lean_spec.types.container import Container
@@ -95,7 +97,13 @@ HELPER_GOSSIP_FORK_DIGEST_ENVIRONMENT_VARIABLE: Final = "HIVE_LEAN_HELPER_GOSSIP
 HELPER_P2P_PORT_ENVIRONMENT_VARIABLE: Final = "HIVE_LEAN_HELPER_P2P_PORT"
 HELPER_API_PORT_ENVIRONMENT_VARIABLE: Final = "HIVE_LEAN_HELPER_API_PORT"
 HELPER_METADATA_PORT_ENVIRONMENT_VARIABLE: Final = "HIVE_LEAN_HELPER_METADATA_PORT"
-VALIDATOR_COUNT: Final = 3
+DISABLE_VALIDATOR_SERVICE_ENVIRONMENT_VARIABLE: Final = "HIVE_LEAN_DISABLE_VALIDATOR_SERVICE"
+GENESIS_VALIDATOR_COUNT_ENVIRONMENT_VARIABLE: Final = "HIVE_LEAN_VALIDATOR_COUNT"
+GOSSIPSUB_V11_PROTOCOL_ID: Final = "/meshsub/1.1.0"
+IDENTIFY_PROTOCOL_ID: Final = "/ipfs/id/1.0.0"
+IDENTIFY_PUSH_PROTOCOL_ID: Final = "/ipfs/id/push/1.0.0"
+LIBP2P_SECP256K1_PUBLIC_KEY_TYPE: Final = 2
+DEFAULT_VALIDATOR_COUNT: Final = 3
 ATTESTATION_PUBKEY_FIELD: Final = "attestation_public"
 ATTESTATION_SECRET_FIELD: Final = "attestation_secret"
 PROPOSAL_PUBKEY_FIELD: Final = "proposal_public"
@@ -126,11 +134,13 @@ def identity_keypair_from_private_key_hex(private_key_hex: str) -> IdentityKeypa
         public_key=Secp256k1PublicKey(_key=private_key.public_key()),
     )
 
-_QUIC_STREAM_CLOSE_PATCHED = False
-_SSZ_FAST_DESERIALIZATION_PATCHED = False
-_SNAPPY_COMPRESS_PATCHED = False
-_REQRESP_BLOCK_CACHE_PATCHED = False
-_NETWORK_SERVICE_GOSSIP_PATCHED = False
+_QUIC_STREAM_CLOSE_COMPAT_INSTALLED = False
+_SSZ_FAST_DESERIALIZATION_INSTALLED = False
+_SNAPPY_COMPRESS_FALLBACK_INSTALLED = False
+_REQRESP_BLOCK_CACHE_TRACKING_INSTALLED = False
+_NETWORK_SERVICE_GOSSIP_TRACKING_INSTALLED = False
+_IDENTIFY_PROTOCOL_COMPAT_INSTALLED = False
+_CHILD_ONLY_AGGREGATION_COMPAT_INSTALLED = False
 _BLOCK_CACHE_BY_REQRESP_CLIENT: dict[int, dict[Bytes32, object]] = {}
 _BLOCK_CACHE_BY_SYNC_SERVICE: dict[int, dict[Bytes32, object]] = {}
 _SYNC_EVENT_CONTEXT: dict[int, tuple[LiveNetworkEventSource, Node]] = {}
@@ -144,10 +154,10 @@ def setup_logging() -> None:
     )
 
 
-def patch_quic_stream_close() -> None:
-    global _QUIC_STREAM_CLOSE_PATCHED
+def install_quic_stream_close_reset_tolerance() -> None:
+    global _QUIC_STREAM_CLOSE_COMPAT_INSTALLED
 
-    if _QUIC_STREAM_CLOSE_PATCHED:
+    if _QUIC_STREAM_CLOSE_COMPAT_INSTALLED:
         return
 
     original_close = QuicStream.close
@@ -168,13 +178,13 @@ def patch_quic_stream_close() -> None:
             )
 
     QuicStream.close = close_ignoring_reset
-    _QUIC_STREAM_CLOSE_PATCHED = True
+    _QUIC_STREAM_CLOSE_COMPAT_INSTALLED = True
 
 
-def patch_fast_ssz_deserialization() -> None:
-    global _SSZ_FAST_DESERIALIZATION_PATCHED
+def install_fast_ssz_deserialization() -> None:
+    global _SSZ_FAST_DESERIALIZATION_INSTALLED
 
-    if _SSZ_FAST_DESERIALIZATION_PATCHED:
+    if _SSZ_FAST_DESERIALIZATION_INSTALLED:
         return
 
     @classmethod
@@ -318,20 +328,19 @@ def patch_fast_ssz_deserialization() -> None:
     SSZVector.deserialize = vector_deserialize_without_validation
     SSZList.deserialize = list_deserialize_without_validation
     Container.deserialize = container_deserialize_without_validation
-    _SSZ_FAST_DESERIALIZATION_PATCHED = True
+    _SSZ_FAST_DESERIALIZATION_INSTALLED = True
 
 
-def patch_snappy_compress() -> None:
-    global _SNAPPY_COMPRESS_PATCHED
+def install_snappy_compress_fallback() -> None:
+    global _SNAPPY_COMPRESS_FALLBACK_INSTALLED
 
-    if _SNAPPY_COMPRESS_PATCHED:
+    if _SNAPPY_COMPRESS_FALLBACK_INSTALLED:
         return
 
     snappy_compress_module = importlib.import_module("lean_spec.snappy.compress")
     networking_service_module = importlib.import_module(
         "lean_spec.subspecs.networking.service.service"
     )
-    original_compress = snappy_compress_module.compress
 
     def literal_only_compress(data: bytes) -> bytes:
         if not data:
@@ -347,23 +356,17 @@ def patch_snappy_compress() -> None:
         return bytes(output)
 
     def compress_with_fallback(data: bytes) -> bytes:
-        try:
-            return original_compress(data)
-        except IndexError:
-            logger.warning(
-                "Falling back to literal-only Snappy compression after helper compressor bug"
-            )
-            return literal_only_compress(data)
+        return literal_only_compress(data)
 
     snappy_compress_module.compress = compress_with_fallback
     networking_service_module.compress = compress_with_fallback
-    _SNAPPY_COMPRESS_PATCHED = True
+    _SNAPPY_COMPRESS_FALLBACK_INSTALLED = True
 
 
-def patch_reqresp_block_cache() -> None:
-    global _REQRESP_BLOCK_CACHE_PATCHED
+def install_reqresp_block_cache_tracking() -> None:
+    global _REQRESP_BLOCK_CACHE_TRACKING_INSTALLED
 
-    if _REQRESP_BLOCK_CACHE_PATCHED:
+    if _REQRESP_BLOCK_CACHE_TRACKING_INSTALLED:
         return
 
     reqresp_client_module = importlib.import_module(
@@ -385,13 +388,13 @@ def patch_reqresp_block_cache() -> None:
         return signed_blocks
 
     reqresp_client_cls.request_blocks_by_root = request_blocks_by_root_with_cache
-    _REQRESP_BLOCK_CACHE_PATCHED = True
+    _REQRESP_BLOCK_CACHE_TRACKING_INSTALLED = True
 
 
-def patch_network_service_gossip_processing() -> None:
-    global _NETWORK_SERVICE_GOSSIP_PATCHED
+def install_network_service_gossip_tracking() -> None:
+    global _NETWORK_SERVICE_GOSSIP_TRACKING_INSTALLED
 
-    if _NETWORK_SERVICE_GOSSIP_PATCHED:
+    if _NETWORK_SERVICE_GOSSIP_TRACKING_INSTALLED:
         return
 
     networking_service_module = importlib.import_module(
@@ -429,7 +432,282 @@ def patch_network_service_gossip_processing() -> None:
         refresh_status(event_source, node)
 
     network_service_cls._handle_event = handle_event_with_helper_backfill
-    _NETWORK_SERVICE_GOSSIP_PATCHED = True
+    _NETWORK_SERVICE_GOSSIP_TRACKING_INSTALLED = True
+
+
+def encode_unsigned_varint(value: int) -> bytes:
+    output = bytearray()
+    while value >= 0x80:
+        output.append((value & 0x7F) | 0x80)
+        value >>= 7
+    output.append(value)
+    return bytes(output)
+
+
+def protobuf_key(field_number: int, wire_type: int) -> bytes:
+    return encode_unsigned_varint((field_number << 3) | wire_type)
+
+
+def protobuf_varint_field(field_number: int, value: int) -> bytes:
+    return protobuf_key(field_number, 0) + encode_unsigned_varint(value)
+
+
+def protobuf_bytes_field(field_number: int, value: bytes) -> bytes:
+    return protobuf_key(field_number, 2) + encode_unsigned_varint(len(value)) + value
+
+
+def protobuf_string_field(field_number: int, value: str) -> bytes:
+    return protobuf_bytes_field(field_number, value.encode("utf-8"))
+
+
+def build_libp2p_public_key(public_key: object) -> bytes:
+    raw_public_key = public_key.to_bytes()
+    return (
+        protobuf_varint_field(1, LIBP2P_SECP256K1_PUBLIC_KEY_TYPE)
+        + protobuf_bytes_field(2, raw_public_key)
+    )
+
+
+def build_identify_response(identity_key: IdentityKeypair) -> bytes:
+    public_key = build_libp2p_public_key(identity_key.public_key)
+    protocols = (
+        IDENTIFY_PROTOCOL_ID,
+        IDENTIFY_PUSH_PROTOCOL_ID,
+        "/leanconsensus/req/status/1/ssz_snappy",
+        "/leanconsensus/req/blocks_by_root/1/ssz_snappy",
+        "/leanconsensus/req/blocks_by_range/1/ssz_snappy",
+        "/meshsub/1.2.0",
+        GOSSIPSUB_V11_PROTOCOL_ID,
+    )
+
+    response = bytearray()
+    response.extend(protobuf_bytes_field(1, public_key))
+    for protocol in protocols:
+        response.extend(protobuf_string_field(3, protocol))
+    response.extend(protobuf_string_field(5, "ipfs/0.1.0"))
+    response.extend(protobuf_string_field(6, "hive-lean-spec-helper/0.1.0"))
+    return bytes(response)
+
+
+async def read_delimited_identify_message(wrapper: object) -> bytes:
+    length = 0
+    shift = 0
+    for _ in range(10):
+        chunk = await wrapper.read(1)
+        if not chunk:
+            raise EOFError("identify stream closed before length prefix")
+        byte = chunk[0]
+        length |= (byte & 0x7F) << shift
+        if byte & 0x80 == 0:
+            break
+        shift += 7
+    else:
+        raise ValueError("identify length prefix is too long")
+
+    if length == 0:
+        return b""
+    if length > 1_048_576:
+        raise ValueError(f"identify message too large: {length} bytes")
+    return await wrapper.readexactly(length)
+
+
+async def handle_identify_stream(
+    event_source: object,
+    peer_id: object,
+    protocol_id: str,
+    wrapper: object,
+) -> None:
+    if protocol_id == IDENTIFY_PROTOCOL_ID:
+        response = getattr(event_source, "_hive_identify_response", b"")
+        wrapper.write(encode_unsigned_varint(len(response)) + response)
+        await wrapper.drain()
+        logger.info("Served identify response to %s", peer_id)
+    elif protocol_id == IDENTIFY_PUSH_PROTOCOL_ID:
+        try:
+            await asyncio.wait_for(read_delimited_identify_message(wrapper), timeout=2.0)
+        except (asyncio.TimeoutError, EOFError):
+            logger.debug("Identify push stream from %s closed without a full payload", peer_id)
+        except Exception as err:
+            logger.debug("Ignoring invalid identify push payload from %s: %s", peer_id, err)
+        else:
+            logger.info("Accepted identify push from %s", peer_id)
+
+    with suppress(Exception):
+        await wrapper.finish_write()
+
+
+def install_identify_protocol_compatibility() -> None:
+    global _IDENTIFY_PROTOCOL_COMPAT_INSTALLED
+
+    if _IDENTIFY_PROTOCOL_COMPAT_INSTALLED:
+        return
+
+    live_module = importlib.import_module(
+        "lean_spec.subspecs.networking.client.event_source.live"
+    )
+    protocol_module = importlib.import_module(
+        "lean_spec.subspecs.networking.client.event_source.protocol"
+    )
+
+    extra_protocols = {
+        GOSSIPSUB_V11_PROTOCOL_ID,
+        IDENTIFY_PROTOCOL_ID,
+        IDENTIFY_PUSH_PROTOCOL_ID,
+    }
+    live_module.SUPPORTED_PROTOCOLS = frozenset(
+        set(live_module.SUPPORTED_PROTOCOLS) | extra_protocols
+    )
+    protocol_module.SUPPORTED_PROTOCOLS = frozenset(
+        set(protocol_module.SUPPORTED_PROTOCOLS) | extra_protocols
+    )
+
+    event_source_cls = live_module.LiveNetworkEventSource
+
+    async def setup_gossipsub_stream_with_v11_fallback(
+        self: object,
+        peer_id: object,
+        conn: object,
+    ) -> None:
+        protocol_ids = []
+        for protocol_id in (
+            live_module.GOSSIPSUB_DEFAULT_PROTOCOL_ID,
+            live_module.GOSSIPSUB_PROTOCOL_ID_V12,
+            GOSSIPSUB_V11_PROTOCOL_ID,
+        ):
+            if protocol_id not in protocol_ids:
+                protocol_ids.append(protocol_id)
+
+        last_error = None
+        for protocol_id in protocol_ids:
+            try:
+                stream = await conn.open_stream(protocol_id)
+                logger.info(
+                    "Opened outbound gossipsub stream_id=%d protocol=%s to %s",
+                    stream.stream_id,
+                    protocol_id,
+                    peer_id,
+                )
+
+                wrapper = live_module.QuicStreamAdapter(stream)
+                await self._gossipsub_behavior.add_peer(
+                    peer_id,
+                    wrapper,
+                    inbound=False,
+                )
+
+                logger.info(
+                    "GossipSub outbound stream established with %s using %s (stream_id=%d)",
+                    peer_id,
+                    protocol_id,
+                    stream.stream_id,
+                )
+                return
+            except Exception as err:
+                last_error = err
+                logger.debug(
+                    "Failed to setup outbound gossipsub stream with %s using %s: %s",
+                    peer_id,
+                    protocol_id,
+                    err,
+                )
+
+        logger.warning("Failed to setup gossipsub stream with %s: %s", peer_id, last_error)
+
+    async def accept_streams_with_identify(
+        self: object,
+        peer_id: object,
+        conn: object,
+    ) -> None:
+        try:
+            logger.info("Stream acceptor started for peer %s", peer_id)
+            while self._running and peer_id in self._connections:
+                try:
+                    stream = await conn.accept_stream()
+                except Exception as err:
+                    logger.debug("Stream accept failed for %s: %s", peer_id, err)
+                    break
+
+                negotiated = await self._negotiate_inbound_stream(peer_id, stream)
+                if negotiated is None:
+                    continue
+                protocol_id, wrapper = negotiated
+
+                if protocol_id in (
+                    live_module.GOSSIPSUB_DEFAULT_PROTOCOL_ID,
+                    live_module.GOSSIPSUB_PROTOCOL_ID_V12,
+                    GOSSIPSUB_V11_PROTOCOL_ID,
+                ):
+                    await self._handle_gossipsub_inbound_stream(
+                        peer_id,
+                        conn,
+                        protocol_id,
+                        wrapper,
+                    )
+                elif protocol_id in live_module.REQRESP_PROTOCOL_IDS:
+                    self._handle_reqresp_inbound_stream(peer_id, protocol_id, wrapper)
+                elif protocol_id in (IDENTIFY_PROTOCOL_ID, IDENTIFY_PUSH_PROTOCOL_ID):
+                    await handle_identify_stream(self, peer_id, protocol_id, wrapper)
+                else:
+                    logger.debug(
+                        "Unknown protocol %s from %s, closing stream", protocol_id, peer_id
+                    )
+                    await stream.close()
+        except asyncio.CancelledError:
+            logger.debug("Stream acceptor cancelled for %s", peer_id)
+        except Exception as err:
+            logger.warning("Stream acceptor error for %s: %s", peer_id, err)
+
+    event_source_cls._setup_gossipsub_stream = setup_gossipsub_stream_with_v11_fallback
+    event_source_cls._accept_streams = accept_streams_with_identify
+    _IDENTIFY_PROTOCOL_COMPAT_INSTALLED = True
+
+
+def install_child_only_aggregation_compatibility() -> None:
+    global _CHILD_ONLY_AGGREGATION_COMPAT_INSTALLED
+
+    if _CHILD_ONLY_AGGREGATION_COMPAT_INSTALLED:
+        return
+
+    original_to_aggregation_bits = ValidatorIndices.to_aggregation_bits
+    original_aggregate = AggregatedSignatureProof.aggregate.__func__
+
+    def to_aggregation_bits_allowing_empty(
+        self: ValidatorIndices,
+    ) -> AggregationBits:
+        if not self.data:
+            return AggregationBits(data=[])
+        return original_to_aggregation_bits(self)
+
+    @classmethod
+    def aggregate_allowing_child_only_merge(
+        cls: type[AggregatedSignatureProof],
+        xmss_participants: AggregationBits | None,
+        children: object,
+        raw_xmss: object,
+        message: Bytes32,
+        slot: object,
+        mode: object | None = None,
+    ) -> AggregatedSignatureProof:
+        if (
+            not raw_xmss
+            and xmss_participants is not None
+            and not any(bool(bit) for bit in xmss_participants.data)
+        ):
+            xmss_participants = None
+
+        return original_aggregate(
+            cls,
+            xmss_participants=xmss_participants,
+            children=children,
+            raw_xmss=raw_xmss,
+            message=message,
+            slot=slot,
+            mode=mode,
+        )
+
+    ValidatorIndices.to_aggregation_bits = to_aggregation_bits_allowing_empty
+    AggregatedSignatureProof.aggregate = aggregate_allowing_child_only_merge
+    _CHILD_ONLY_AGGREGATION_COMPAT_INSTALLED = True
 
 
 def parse_bootnodes() -> list[str]:
@@ -446,6 +724,17 @@ def parse_validator_indices() -> list[int]:
         return []
 
     return [int(index) for index in raw_indices.split(",") if index]
+
+
+def genesis_validator_count() -> int:
+    raw_count = os.environ.get(GENESIS_VALIDATOR_COUNT_ENVIRONMENT_VARIABLE, "")
+    if not raw_count:
+        return DEFAULT_VALIDATOR_COUNT
+
+    count = int(raw_count)
+    if count < 0:
+        raise ValueError(f"{GENESIS_VALIDATOR_COUNT_ENVIRONMENT_VARIABLE} must be non-negative")
+    return count
 
 
 def devnet_label() -> str:
@@ -617,7 +906,13 @@ def write_validator_keys(
 def prepare_runtime_assets(node_id: str) -> None:
     genesis_time = int(os.environ.get("HIVE_LEAN_GENESIS_TIME", int(time.time()) + 30))
     validator_indices = parse_validator_indices()
-    validators = [load_validator(index) for index in range(VALIDATOR_COUNT)]
+    validator_count = genesis_validator_count()
+    if validator_indices and max(validator_indices) >= validator_count:
+        raise ValueError(
+            f"{GENESIS_VALIDATOR_COUNT_ENVIRONMENT_VARIABLE}={validator_count} does not include "
+            f"assigned validator index {max(validator_indices)}"
+        )
+    validators = [load_validator(index) for index in range(validator_count)]
 
     prepare_output_dirs()
     write_genesis(validators, genesis_time)
@@ -808,6 +1103,10 @@ def subscribe_gossip_topics(
     block_topic = GossipTopic.block(fork_digest).to_topic_id()
     event_source.subscribe_gossip_topic(block_topic)
 
+    if is_aggregator and hasattr(GossipTopic, "committee_aggregation"):
+        aggregation_topic = GossipTopic.committee_aggregation(fork_digest).to_topic_id()
+        event_source.subscribe_gossip_topic(aggregation_topic)
+
     subscribed_subnets: set[SubnetId] = set()
     if validator_registry is not None:
         for validator_index in validator_registry.indices():
@@ -919,11 +1218,12 @@ async def dial_bootnodes(
 
 async def run() -> None:
     setup_logging()
-    patch_quic_stream_close()
-    patch_fast_ssz_deserialization()
-    patch_snappy_compress()
-    patch_reqresp_block_cache()
-    patch_network_service_gossip_processing()
+    install_quic_stream_close_reset_tolerance()
+    install_snappy_compress_fallback()
+    install_reqresp_block_cache_tracking()
+    install_network_service_gossip_tracking()
+    install_identify_protocol_compatibility()
+    install_child_only_aggregation_compatibility()
     metrics.init(name="lean-spec-client", version="0.0.1")
 
     node_id = os.environ.get("HIVE_NODE_ID", DEFAULT_NODE_ID)
@@ -938,6 +1238,9 @@ async def run() -> None:
     validator_registry = load_validator_registry(node_id)
     bootnodes = parse_bootnodes()
     is_aggregator = os.environ.get("HIVE_IS_AGGREGATOR", "0") == "1"
+    disable_validator_service = (
+        os.environ.get(DISABLE_VALIDATOR_SERVICE_ENVIRONMENT_VARIABLE, "0") == "1"
+    )
 
     assigned_validators = (
         [int(index) for index in validator_registry.indices()]
@@ -945,10 +1248,11 @@ async def run() -> None:
         else []
     )
     logger.info(
-        "Configured helper genesis_time=%d validator_count=%d assigned_validators=%s",
+        "Configured helper genesis_time=%d validator_count=%d assigned_validators=%s disable_validator_service=%s",
         genesis.genesis_time,
         len(genesis.genesis_validators),
         assigned_validators,
+        disable_validator_service,
     )
     connection_manager = await QuicConnectionManager.create(identity_key)
     metadata["bootnode_enr"] = build_helper_bootnode_enr(identity_key)
@@ -960,6 +1264,7 @@ async def run() -> None:
         str(connection_manager.peer_id)
     )
     event_source = await LiveNetworkEventSource.create(connection_manager=connection_manager)
+    event_source._hive_identify_response = build_identify_response(identity_key)
     configure_event_source_network(event_source, helper_gossip_fork_digest())
     subscribe_gossip_topics(event_source, validator_registry, is_aggregator)
     logger.info("Helper peer_id=%s", connection_manager.peer_id)
@@ -974,20 +1279,30 @@ async def run() -> None:
             fork_digest=helper_gossip_fork_digest(),
         )
     )
+    if disable_validator_service and node.validator_service is not None:
+        logger.info("Disabling local validator service for passive helper")
+        node.validator_service = None
+
     published_blocks: dict[Bytes32, object] = {}
+    _BLOCK_CACHE_BY_SYNC_SERVICE[id(node.sync_service)] = published_blocks
+    _SYNC_EVENT_CONTEXT[id(node.sync_service)] = (event_source, node)
+    _BLOCK_CACHE_BY_REQRESP_CLIENT[id(event_source.reqresp_client)] = published_blocks
+
+    def lookup_published_block(root: Bytes32) -> object | None:
+        return published_blocks.get(root)
+
+    async def lookup_published_block_async(root: Bytes32) -> object | None:
+        return lookup_published_block(root)
+
     api_server_kwargs = {
         "config": ApiServerConfig(port=helper_api_port()),
         "store_getter": lambda: node.sync_service.store,
     }
     if api_server_supports_signed_block_getter():
-        api_server_kwargs["signed_block_getter"] = lambda root: published_blocks.get(root)
+        api_server_kwargs["signed_block_getter"] = lookup_published_block
     api_server = ApiServer(**api_server_kwargs)
     metadata_runner = await start_metadata_server(metadata)
     refresh_status(event_source, node)
-
-    _BLOCK_CACHE_BY_SYNC_SERVICE[id(node.sync_service)] = published_blocks
-    _SYNC_EVENT_CONTEXT[id(node.sync_service)] = (event_source, node)
-    _BLOCK_CACHE_BY_REQRESP_CLIENT[id(event_source.reqresp_client)] = published_blocks
 
     if node.validator_service is not None:
         original_on_block = node.validator_service.on_block
@@ -999,14 +1314,11 @@ async def run() -> None:
 
         node.validator_service.on_block = cache_and_publish_block
 
-    async def lookup_published_block(root: Bytes32) -> object | None:
-        return published_blocks.get(root)
+    event_source.set_block_lookup(lookup_published_block_async)
 
-    event_source.set_block_lookup(lookup_published_block)
-
-    await dial_bootnodes(event_source, bootnodes)
     listener_task = await start_listener_and_gossipsub(event_source)
     event_source._running = True
+    await dial_bootnodes(event_source, bootnodes)
 
     node_task = asyncio.create_task(
         node.run(install_signal_handlers=False),
